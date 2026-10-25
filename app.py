@@ -24,7 +24,7 @@ between IMF member countries and the Euro Area using official IMF SDMX 3.0 API e
 )
 
 # ---------------------------------------------------------
-# Country Dictionary (IMF ISO3 & G163 for Euro Area)
+# Expanded Country Dictionary (IMF ISO3 & G163 for Euro Area)
 # ---------------------------------------------------------
 COUNTRY_OPTIONS = {
     "Euro Area (19/20 countries)": "G163",
@@ -46,6 +46,19 @@ COUNTRY_OPTIONS = {
     "Singapore": "SGP",
     "Chile": "CHL",
     "Colombia": "COL",
+    "Argentina": "ARG",
+    "Turkey": "TUR",
+    "Poland": "POL",
+    "Indonesia": "IDN",
+    "Malaysia": "MYS",
+    "Thailand": "THA",
+    "Philippines": "PHL",
+    "Vietnam": "VNM",
+    "Saudi Arabia": "SAU",
+    "Israel": "ISR",
+    "Egypt": "EGY",
+    "Peru": "PER",
+    "Denmark": "DNK"
 }
 
 # ---------------------------------------------------------
@@ -81,20 +94,20 @@ chart_mode = st.sidebar.radio(
 def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
     """
     Fetches monthly time series from the IMF SDMX 3.0 REST API.
-    Attempts CSV response first (fastest and most robust), falling back to SDMX-JSON.
+    URL Format: https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/{dataflow}/~/{key}
     """
     base_url = f"https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/{dataflow}/~/{key}"
-    params = {"c[TIME_PERIOD]": "ge:1976-01"}
-    headers_csv = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv"
-    }
     
-    # 1. Try CSV stream
+    # Try CSV stream first (fastest and most robust)
     try:
-        resp = requests.get(base_url, headers=headers_csv, params=params, timeout=45)
+        csv_headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv"
+        }
+        resp = requests.get(base_url, headers=csv_headers, timeout=45)
         if resp.status_code == 200 and len(resp.text.strip()) > 50:
             df_csv = pd.read_csv(io.StringIO(resp.text))
+            
             time_col = next((c for c in df_csv.columns if c.upper() in ["TIME_PERIOD", "TIME"]), None)
             val_col = next((c for c in df_csv.columns if c.upper() in ["OBS_VALUE", "VALUE"]), None)
             
@@ -109,13 +122,13 @@ def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
     except Exception:
         pass
 
-    # 2. Fallback to SDMX-JSON
+    # Fallback to SDMX-JSON if CSV fails
     try:
-        headers_json = {
+        json_headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/vnd.sdmx.data+json;version=2.0.0, application/json"
         }
-        resp = requests.get(base_url, headers=headers_json, params=params, timeout=45)
+        resp = requests.get(base_url, headers=json_headers, timeout=45)
         if resp.status_code == 200:
             data_json = resp.json()
             data_block = data_json.get("data", data_json)
@@ -152,8 +165,9 @@ def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
 
     return pd.Series(dtype=float)
 
+
 def get_cpi(iso: str) -> pd.Series:
-    """Monthly CPI key: {ISO3}.CPI._T.IX.M. Includes fallbacks for Euro Area."""
+    """Retrieves monthly CPI with fallbacks for alternative IMF codes."""
     s = fetch_imf_sdmx_series("CPI", f"{iso}.CPI._T.IX.M")
     
     if s.empty and iso == "G163":
@@ -162,8 +176,9 @@ def get_cpi(iso: str) -> pd.Series:
             s = fetch_imf_sdmx_series("IFS", "M.U2.PCPI_IX")
     return s
 
+
 def get_fx_vs_usd(iso: str) -> pd.Series:
-    """Returns currency units per 1 USD. Includes fallbacks for Euro Area."""
+    """Retrieves currency units per 1 USD."""
     if iso == "USA":
         idx = pd.date_range("1976-01-01", datetime.date.today(), freq="MS")
         return pd.Series(1.0, index=idx)
@@ -176,6 +191,7 @@ def get_fx_vs_usd(iso: str) -> pd.Series:
             s = fetch_imf_sdmx_series("IFS", "M.U2.TXC_USD_PT")
     return s
 
+
 # ---------------------------------------------------------
 # Load Series & Validate
 # ---------------------------------------------------------
@@ -185,11 +201,17 @@ with st.spinner("Connecting to IMF SDMX 3.0 API..."):
     fx1_usd = get_fx_vs_usd(iso1)
     fx2_usd = get_fx_vs_usd(iso2)
 
+# Truncate to >= 1976 locally
+if not cpi1.empty: cpi1 = cpi1[cpi1.index >= "1976-01-01"]
+if not cpi2.empty: cpi2 = cpi2[cpi2.index >= "1976-01-01"]
+if not fx1_usd.empty: fx1_usd = fx1_usd[fx1_usd.index >= "1976-01-01"]
+if not fx2_usd.empty: fx2_usd = fx2_usd[fx2_usd.index >= "1976-01-01"]
+
 errors = []
 if cpi1.empty:
-    errors.append(f"CPI data for {c1_name} ({iso1}) could not be retrieved from the IMF API.")
+    errors.append(f"CPI data for {c1_name} ({iso1}) could not be retrieved.")
 if cpi2.empty:
-    errors.append(f"CPI data for {c2_name} ({iso2}) could not be retrieved from the IMF API.")
+    errors.append(f"CPI data for {c2_name} ({iso2}) could not be retrieved.")
 if fx1_usd.empty:
     errors.append(f"Exchange rate data for {c1_name} ({iso1}) could not be retrieved.")
 if fx2_usd.empty:
