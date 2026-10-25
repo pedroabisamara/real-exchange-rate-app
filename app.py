@@ -81,26 +81,25 @@ chart_mode = st.sidebar.radio(
 def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
     """
     Fetches monthly time series from the IMF SDMX 3.0 REST API.
-    URL Format: https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/{dataflow}/~/{key}
     Attempts CSV response first (fastest and most robust), falling back to SDMX-JSON.
     """
     base_url = f"https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/{dataflow}/~/{key}"
     params = {"c[TIME_PERIOD]": "ge:1976-01"}
+    headers_csv = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "text/csv"
+    }
     
     # 1. Try CSV stream
     try:
-        csv_headers = {"Accept": "text/csv"}
-        resp = requests.get(base_url, headers=csv_headers, params=params, timeout=25)
+        resp = requests.get(base_url, headers=headers_csv, params=params, timeout=45)
         if resp.status_code == 200 and len(resp.text.strip()) > 50:
             df_csv = pd.read_csv(io.StringIO(resp.text))
-            
-            # Find time and value columns across SDMX CSV formats
             time_col = next((c for c in df_csv.columns if c.upper() in ["TIME_PERIOD", "TIME"]), None)
             val_col = next((c for c in df_csv.columns if c.upper() in ["OBS_VALUE", "VALUE"]), None)
             
             if time_col and val_col:
                 df_clean = df_csv[[time_col, val_col]].dropna()
-                # Dates from IMF come as '1999-M01' or '1999-01'
                 df_clean[time_col] = df_clean[time_col].astype(str).str.replace("-M", "-")
                 df_clean["Date"] = pd.to_datetime(df_clean[time_col], errors="coerce")
                 df_clean = df_clean.dropna(subset=["Date"]).sort_values("Date")
@@ -112,15 +111,17 @@ def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
 
     # 2. Fallback to SDMX-JSON
     try:
-        json_headers = {"Accept": "application/vnd.sdmx.data+json;version=2.0.0, application/json"}
-        resp = requests.get(base_url, headers=json_headers, params=params, timeout=25)
+        headers_json = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/vnd.sdmx.data+json;version=2.0.0, application/json"
+        }
+        resp = requests.get(base_url, headers=headers_json, params=params, timeout=45)
         if resp.status_code == 200:
             data_json = resp.json()
             data_block = data_json.get("data", data_json)
             datasets = data_block.get("dataSets", [{}])[0]
             structure = data_block.get("structure", {})
             
-            # Extract time values
             obs_dims = structure.get("dimensions", {}).get("observation", [])
             time_dim = next((d for d in obs_dims if d.get("id") in ["TIME_PERIOD", "TIME"]), None)
             if not time_dim:
@@ -129,7 +130,6 @@ def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
             
             time_periods = [v.get("id") for v in time_dim.get("values", [])] if time_dim else []
 
-            # Extract observations
             obs_dict = datasets.get("observations", {})
             if not obs_dict and "series" in datasets:
                 first_series = next(iter(datasets["series"].values()), {})
@@ -154,20 +154,30 @@ def fetch_imf_sdmx_series(dataflow: str, key: str) -> pd.Series:
 
 
 def get_cpi(iso: str) -> pd.Series:
-    """Monthly CPI key: {ISO3}.CPI._T.IX.M from dataflow CPI"""
-    return fetch_imf_sdmx_series("CPI", f"{iso}.CPI._T.IX.M")
+    """Monthly CPI key: {ISO3}.CPI._T.IX.M. Includes fallbacks for Euro Area."""
+    s = fetch_imf_sdmx_series("CPI", f"{iso}.CPI._T.IX.M")
+    
+    # Fallback mappings if the standard CPI key fails
+    if s.empty and iso == "G163":
+        s = fetch_imf_sdmx_series("CPI", "U2.CPI._T.IX.M")
+        if s.empty:
+            s = fetch_imf_sdmx_series("IFS", "M.U2.PCPI_IX")
+    return s
 
 
 def get_fx_vs_usd(iso: str) -> pd.Series:
-    """
-    Returns currency units per 1 USD (XDC/USD).
-    If Country is USA, rate is identical to 1.0.
-    Monthly exchange-rate key: {ISO3}.XDC_USD.PA_RT.M from dataflow ER
-    """
+    """Returns currency units per 1 USD. Includes fallbacks for Euro Area."""
     if iso == "USA":
         idx = pd.date_range("1976-01-01", datetime.date.today(), freq="MS")
         return pd.Series(1.0, index=idx)
-    return fetch_imf_sdmx_series("ER", f"{iso}.XDC_USD.PA_RT.M")
+        
+    s = fetch_imf_sdmx_series("ER", f"{iso}.XDC_USD.PA_RT.M")
+    
+    if s.empty and iso == "G163":
+        s = fetch_imf_sdmx_series("ER", "U2.XDC_USD.PA_RT.M")
+        if s.empty:
+            s = fetch_imf_sdmx_series("IFS", "M.U2.TXC_USD_PT")
+    return s
 
 
 # ---------------------------------------------------------
@@ -181,22 +191,19 @@ with st.spinner("Connecting to IMF SDMX 3.0 API..."):
 
 errors = []
 if cpi1.empty:
-    errors.append(f"CPI data for {c1_name} ({iso1}) could not be retrieved from IMF CPI dataflow.")
+    errors.append(f"CPI data for {c1_name} ({iso1}) could not be retrieved from the IMF API.")
 if cpi2.empty:
-    errors.append(f"CPI data for {c2_name} ({iso2}) could not be retrieved from IMF CPI dataflow.")
+    errors.append(f"CPI data for {c2_name} ({iso2}) could not be retrieved from the IMF API.")
 if fx1_usd.empty:
-    errors.append(f"Exchange rate data for {c1_name} ({iso1}) could not be retrieved from IMF ER dataflow.")
+    errors.append(f"Exchange rate data for {c1_name} ({iso1}) could not be retrieved.")
 if fx2_usd.empty:
-    errors.append(f"Exchange rate data for {c2_name} ({iso2}) could not be retrieved from IMF ER dataflow.")
+    errors.append(f"Exchange rate data for {c2_name} ({iso2}) could not be retrieved.")
 
 if errors:
     st.error("### Data Fetch Error / Coverage Limitation")
     for err in errors:
         st.warning(f"- {err}")
-    st.info(
-        "Tip: Ensure the IMF server is accessible. Core economies with long continuous data like "
-        "Euro Area (G163), United States (USA), United Kingdom (GBR), and Japan (JPN) have complete coverage."
-    )
+    st.info("Tip: Ensure the IMF server is accessible. Try refreshing the app in a few seconds.")
     st.stop()
 
 # ---------------------------------------------------------
@@ -213,13 +220,7 @@ if df_all.empty:
     st.warning("No overlapping monthly observations found across all 4 series.")
     st.stop()
 
-# S(t) = units of Country 2 currency per 1 unit of Country 1 currency
-# FX1 = C1/USD => 1 C1 = (1/FX1) USD
-# FX2 = C2/USD => 1 USD = FX2 C2
-# S(t) = FX2 / FX1
 df_all["S_t"] = df_all["FX2_USD"] / df_all["FX1_USD"]
-
-# RER(t) = S(t) * P1(t) / P2(t)
 df_all["RER_t"] = df_all["S_t"] * df_all["CPI1"] / df_all["CPI2"]
 
 # ---------------------------------------------------------
@@ -248,10 +249,7 @@ if df.empty:
     st.error("No valid observations exist within the chosen dates.")
     st.stop()
 
-# RER* = arithmetic average of RER(t) over valid months in the chosen window
 rer_star = df["RER_t"].mean()
-
-# Real Index(t) = 100 * RER(t) / RER*
 df["Real_Index_t"] = 100.0 * df["RER_t"] / rer_star
 
 # ---------------------------------------------------------
@@ -287,118 +285,4 @@ else:
 # ---------------------------------------------------------
 if chart_mode == "Real Index (Base 100)":
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["Real_Index_t"],
-            mode="lines",
-            name="Real Index (Mean = 100)",
-            line=dict(color="#1f77b4", width=2.5),
-        )
-    )
-    fig.add_hline(
-        y=100,
-        line_dash="dash",
-        line_color="red",
-        annotation_text="Benchmark RER* = 100",
-        annotation_position="top left",
-    )
-    fig.update_layout(
-        title=f"Real Exchange Rate Index: {c1_name} vs. {c2_name} (Base 100)",
-        xaxis_title="Date",
-        yaxis_title="Real Index",
-        hovermode="x unified",
-        template="plotly_white",
-        height=550,
-    )
-
-elif chart_mode == "Nominal S(t)":
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["S_t"],
-            mode="lines",
-            name=f"Nominal S(t) ({c2_name} units)",
-            line=dict(color="#2ca02c", width=2.5),
-        )
-    )
-    fig.update_layout(
-        title=f"Nominal Exchange Rate S(t): {c2_name} per 1 {c1_name} (Actual Currency Units)",
-        xaxis_title="Date",
-        yaxis_title=f"{c2_name} Currency Units",
-        hovermode="x unified",
-        template="plotly_white",
-        height=550,
-    )
-
-else:  # Both (Dual Axes)
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["Real_Index_t"],
-            name="Real Index (Base 100)",
-            line=dict(color="#1f77b4", width=2.5),
-        ),
-        secondary_y=False,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df.index,
-            y=df["S_t"],
-            name=f"Nominal S(t) ({c2_name} units)",
-            line=dict(color="#2ca02c", width=2, dash="dot"),
-        ),
-        secondary_y=True,
-    )
-    fig.add_hline(
-        y=100,
-        line_dash="dash",
-        line_color="rgba(255, 0, 0, 0.7)",
-        secondary_y=False,
-        annotation_text="RER* = 100",
-        annotation_position="top left",
-    )
-    fig.update_layout(
-        title=f"Real Index (Base 100) vs. Nominal Spot Rate ({c1_name} / {c2_name})",
-        xaxis_title="Date",
-        hovermode="x unified",
-        template="plotly_white",
-        height=550,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig.update_yaxes(title_text="Real Index (Mean = 100)", secondary_y=False)
-    fig.update_yaxes(title_text=f"Nominal S(t) ({c2_name} per 1 {c1_name})", secondary_y=True)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------------------------------------
-# CSV Download
-# ---------------------------------------------------------
-st.subheader("Data & Calculation Export")
-
-export_df = pd.DataFrame({
-    "Date": df.index.strftime("%Y-%m"),
-    "Country1_ISO": iso1,
-    "Country2_ISO": iso2,
-    "CPI_Country1_P1": df["CPI1"].round(4),
-    "CPI_Country2_P2": df["CPI2"].round(4),
-    "FX1_per_USD": df["FX1_USD"].round(6),
-    "FX2_per_USD": df["FX2_USD"].round(6),
-    "Nominal_S_t": df["S_t"].round(6),
-    "RER_t_raw": df["RER_t"].round(6),
-    "RER_benchmark_mean": round(rer_star, 6),
-    "Real_Index_t": df["Real_Index_t"].round(4),
-})
-
-csv_data = export_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="📥 Download Observations as CSV",
-    data=csv_data,
-    file_name=f"rer_{iso1}_{iso2}_{start_d}_{end_d}.csv",
-    mime="text/csv",
-)
-
-with st.expander("Preview Historical Calculations"):
-    st.dataframe(export_df, use_container_width=True)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Real_Index_t"], mode="lines", name="Real Index", line=dict(color="#1f
